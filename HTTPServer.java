@@ -1,174 +1,287 @@
-import com.sun.net.httpserver.HttpContext;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
-import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.*;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class HTTPServer {
 	private static final int PORT = 8080;
 
-	public static void main(String[] args) {
-		try {
-			HttpServer httpServer = HttpServer.create(new InetSocketAddress(PORT), -1);
-			System.out.println("HTTP server started: listening on port " + PORT);
+	private int contentLength;
 
-			HttpContext context = httpServer.createContext("/");
-			context.setHandler(new HTTPHandler());
-			httpServer.start();
+	public static void main(String[] args) {
+		HTTPServer httpServer = new HTTPServer();
+
+		try {
+			ServerSocket httpServerSocket= new ServerSocket(PORT);
+			ExecutorService executorService = Executors.newFixedThreadPool(10);
+			System.out.println("Listening at port " + PORT);
+
+			while (true) {
+				Socket socket = httpServerSocket.accept();
+				if (socket != null) {
+					executorService.submit(() -> {
+						try {
+							httpServer.handleRequest(socket);
+						} catch (Exception e) {
+							e.printStackTrace();
+						}
+					});
+				}
+			}
 		} catch (IOException exception) {
 			exception.printStackTrace();
 		}
 	}
 
-	public static class HTTPHandler implements HttpHandler {
+	private void handleRequest(Socket socket) throws Exception {
+		System.out.println("Received Connection!");
 
-		@Override
-		public void handle(HttpExchange exchange) throws IOException {
-			String method = exchange.getRequestMethod().toUpperCase();
-			String path = exchange.getRequestURI().getPath();
+		Map<ContentHeader, String> headerContent = new HashMap<>();
+		BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+		PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream()));
 
-			switch (method) {
-				case "GET" -> handleGet(exchange, path);
-				case "POST" -> handlePost(exchange, path);
-				case "PUT" -> handlePut(exchange, path);
-				case "DELETE" -> handleDelete(exchange, path);
-				default -> sendResponse(exchange, "INVALID METHOD".getBytes(StandardCharsets.UTF_8), 400, 0);
-			}
+		String firstLine = in.readLine();
+		if(firstLine == null || firstLine.isEmpty()) {
+			return ;
 		}
 
-		private void handleDelete(HttpExchange exchange, String path) throws IOException {
-			String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-			String contentLengthStr = exchange.getRequestHeaders().getFirst("Content-Length");
-			if(!checkRequestHeader(contentType, contentLengthStr, exchange)) {
-				return ;
+		Method method;
+		try {
+			method = Method.valueOf(firstLine.split(" ")[0].toUpperCase());
+		} catch (IllegalArgumentException e) {
+			System.out.println("Illegal Http Method");
+			String msg = "Method Not Allowed";
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 405, out, msg.getBytes(StandardCharsets.UTF_8).length);
+			return ;
+		}
+
+		String content = firstLine.split(" ")[1];
+
+		String line;
+		while ((line = in.readLine()) != null) {
+			if (line.isEmpty()) {
+				break;
 			}
 
 			try {
-				Path filePath = Paths.get("." + path);
-
-				if(!Files.exists(filePath)) {
-					sendResponse(exchange, "File Not Found".getBytes(StandardCharsets.UTF_8), 404, 0);
-					return ;
+				String headerContentField = line.split(": ")[0];
+				String headerContentValue = line.split(": ")[1];
+				ContentHeader headerField = ContentHeader.fromString(headerContentField);
+				if (headerField != null) {
+					headerContent.put(headerField, headerContentValue);
 				}
-				Files.delete(filePath);
-				sendResponse(exchange, "Successfully Deleted".getBytes(StandardCharsets.UTF_8), 200, 0);
-			} catch (IOException e) {
-				sendResponse(exchange, "Server Error".getBytes(StandardCharsets.UTF_8), 500, 0);
+			} catch (IllegalArgumentException ignored) {
 			}
 		}
+		HTTPHeader httpHeader = new HTTPHeader(headerContent.get(ContentHeader.CONTENTTYPE), Integer.parseInt(headerContent.get(ContentHeader.CONTENTLENGTH)), content, method);
 
-		private void handlePut(HttpExchange exchange, String path) throws IOException {
-			String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-			String contentLengthStr = exchange.getRequestHeaders().getFirst("Content-Length");
-			if(!checkRequestHeader(contentType, contentLengthStr, exchange)) {
-				return ;
-			}
-
-			if(Objects.equals(contentType, "image/png")) {
-				sendResponse(exchange, "Bad Content-Type".getBytes(StandardCharsets.UTF_8), 400, 0);
-				return ;
-			}
-
-			try {
-				Path filePath = Paths.get("." + path);
-
-				byte[] bodyContent = exchange.getRequestBody().readAllBytes();
-				if(!Files.exists(filePath)) {
-					Files.createFile(filePath);
-				}
-				Files.write(filePath, bodyContent);
-				sendResponse(exchange, "Successfully put".getBytes(StandardCharsets.UTF_8), 200, "Successfully put".length());
-			} catch (IOException e) {
-				sendResponse(exchange, "Server Error".getBytes(StandardCharsets.UTF_8), 500, 0);
-			}
+		if (httpHeader.getMethod().equals(Method.GET)) {
+			handleGet(httpHeader, out);
+		} else if (httpHeader.getMethod().equals(Method.POST)) {
+			handlePost(httpHeader, in, out);
+		} else if (httpHeader.getMethod().equals(Method.PUT)) {
+			handlePut(httpHeader, in, out);;
+		} else if (httpHeader.getMethod().equals(Method.DELETE)) {
+			handleDelete(httpHeader, out);
+		} else {
+			String msg = "Method Not Allowed";
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 405, out, msg.getBytes(StandardCharsets.UTF_8).length);
 		}
 
-		private void handlePost(HttpExchange exchange, String path) throws IOException {
-			String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-			String contentLengthStr = exchange.getRequestHeaders().getFirst("Content-Length");
+		socket.close();
+	}
 
-			if(!checkRequestHeader(contentType, contentLengthStr, exchange)) {
-				return ;
+	private void handleDelete(HTTPHeader httpHeader, PrintWriter out) {
+		try {
+			Path filePath = Paths.get("." + httpHeader.getContent());
+
+			if(!Files.exists(filePath)) {
+				String msg = "Not Exists!!";
+				sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 404, out, msg.getBytes(StandardCharsets.UTF_8).length);
+				return;
+			}
+			Files.delete(filePath);
+
+			String msg = "Successfully deleted";
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 200, out, msg.getBytes(StandardCharsets.UTF_8).length);
+		} catch (Exception ignore) {
+		}
+	}
+
+	private void handlePut(HTTPHeader httpHeader, BufferedReader in, PrintWriter out) {
+		try {
+			MIMETypes mimeTypes = MIMETypes.fromString(httpHeader.getContentType());
+			if(!mimeTypes.equals(MIMETypes.TEXTPLAIN)) {
+				String msg = "Unsupported MIME type for Post Request";
+				sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 400, out, msg.getBytes(StandardCharsets.UTF_8).length);
 			}
 
-			if(!Objects.equals(contentType, "text/plain")) {
-				sendResponse(exchange, "Bad Content-Type".getBytes(StandardCharsets.UTF_8), 400, 0);
-				return ;
+			byte[] bodyContent = getBody(in, httpHeader.getContentLength());
+			Path filePath = Paths.get("." + httpHeader.getContent());
+
+			if(!Files.exists(filePath)) {
+				Files.createFile(filePath);
 			}
+			Files.write(filePath, bodyContent);
 
-			try {
-				String fileMIMEType = Files.probeContentType(new File(path).toPath());
+			String msg = "Successfully put";
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 200, out, msg.getBytes(StandardCharsets.UTF_8).length);
+		} catch (Exception e) {
+			sendResponse(e.getMessage(), MIMETypes.TEXTPLAIN.getValue(), 400, out, e.getMessage().getBytes(StandardCharsets.UTF_8).length);
+		}
+	}
 
-				if(!fileMIMEType.equals("text/plain")) {
-					sendResponse(exchange, "Bad Content-Type".getBytes(StandardCharsets.UTF_8), 400, 0);
-				} else {
-					byte[] bodyContent = exchange.getRequestBody().readAllBytes();
-					Files.write(Paths.get("." + path), bodyContent, StandardOpenOption.APPEND);
-
-					sendResponse(exchange, "Successfully Posted".getBytes(StandardCharsets.UTF_8), 200, "Successfully Posted".length());
-				}
-			} catch (IOException e) {
-				sendResponse(exchange, "File Not Found".getBytes(StandardCharsets.UTF_8), 404, 0);
+	private void handlePost(HTTPHeader httpHeader, BufferedReader in, PrintWriter out) {
+		try {
+			MIMETypes mimeTypes = MIMETypes.fromString(httpHeader.getContentType());
+			if(!mimeTypes.equals(MIMETypes.TEXTPLAIN)) {
+				String msg = "Unsupported MIME type for Post Request";
+				sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 400, out, msg.getBytes(StandardCharsets.UTF_8).length);
 			}
+			byte[] bodyContent = getBody(in, httpHeader.getContentLength());
+			Files.write(Paths.get("." + httpHeader.getContent()), bodyContent, StandardOpenOption.APPEND);
+
+			String msg = "Successfully posted";
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 200, out, msg.getBytes(StandardCharsets.UTF_8).length);
+		} catch (Exception e) {
+			sendResponse(e.getMessage(), MIMETypes.TEXTPLAIN.getValue(), 400, out, e.getMessage().getBytes(StandardCharsets.UTF_8).length);
+		}
+	}
+
+	private byte[] getBody (BufferedReader in, int length) throws IOException {
+		byte[] body = new byte[length];
+
+		for(int i = 0; i < length; i++) {
+			body[i] = (byte) in.read();
 		}
 
-		private void handleGet(HttpExchange exchange, String path) throws IOException {
-			String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
-			String contentLengthStr = exchange.getRequestHeaders().getFirst("Content-Length");
+		return body;
+	}
 
-			if(!checkRequestHeader(contentType, contentLengthStr, exchange)) {
-				return ;
+	private void handleGet(HTTPHeader httpHeader, PrintWriter out) {
+		try {
+			MIMETypes mimeTypes = MIMETypes.fromString(httpHeader.getContentType());
+			File file = new File("." + httpHeader.getContent());
+
+			FileInputStream fileInputStream = new FileInputStream(file);
+			byte[] fileContent = fileInputStream.readAllBytes();
+			if(fileContent.length == 0) {
+				String msg = "Unable to find indicated file";
+				sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 400, out, msg.getBytes(StandardCharsets.UTF_8).length);
+			} else {
+				assert mimeTypes != null;
+				sendResponse(new String(fileContent), mimeTypes.getValue(), 200, out, (int) file.length());
 			}
 
-			try {
-				String fileMIMEType = Files.probeContentType(new File(path).toPath());
+		} catch (Exception e) {
+			String msg = "Unsupported MIME type for Get Request";
+			System.out.println("Unsupported MIME type for Get Request");
+			sendResponse(msg, MIMETypes.TEXTPLAIN.getValue(), 400, out, msg.getBytes(StandardCharsets.UTF_8).length);
+		}
+	}
 
-				if(!fileMIMEType.equals(contentType)) {
-					sendResponse(exchange, "Bad Content-Type".getBytes(StandardCharsets.UTF_8), 400, 0);
-				} else {
-					byte[] fileContent = Files.readAllBytes(Paths.get("." + path));
-					if(fileContent == null || fileContent.length == 0) {
-						sendResponse(exchange, "Server Error".getBytes(StandardCharsets.UTF_8), 500, "Server Error".length());
-					} else {
-						exchange.getResponseHeaders().set("Content-Type", contentType);
+	private void sendResponse(String content, String mimeType, int statusCode, PrintWriter out, int length) {
+		out.printf("HTTP/1.1 %d \r\n", statusCode);
+		out.printf("Content-Type: %s\r\n", mimeType);
+		out.printf("Content-Length: %s\r\n", length);
+		out.printf("\r\n");
+		out.write(content);
+		out.flush();
+	}
 
-						sendResponse(exchange, fileContent, 200, fileContent.length);
-					}
-				}
-			} catch (IOException e) {
-				sendResponse(exchange, "File Not Found".getBytes(StandardCharsets.UTF_8), 404, 0);
-			}
+	public static class HTTPHeader {
+		private final String contentType;
+		private final int contentLength;
+		private final String content;
+		private final Method method;
+
+		public HTTPHeader(String contentType, int contentLength, String content, Method method) {
+			this.contentType = contentType;
+			this.contentLength = contentLength;
+			this.content = content;
+			this.method = method;
 		}
 
-		private boolean checkRequestHeader(String contentType, String contentLengthStr, HttpExchange exchange) throws IOException {
-			if(contentType == null || contentType.matches("-?\\d+")) {
-				sendResponse(exchange, "Bad Content-Type".getBytes(StandardCharsets.UTF_8), 400, 0);
-				return false;
-			}
 
-			if(contentLengthStr == null || !contentLengthStr.matches("-?\\d+") || Integer.parseInt(contentLengthStr) == 0) {
-				sendResponse(exchange, "Bad Content-Length".getBytes(StandardCharsets.UTF_8), 400, 0);
-				return false;
-			}
-			return true;
+		public String getContentType() {
+			return contentType;
 		}
 
-
-		private void sendResponse(HttpExchange exchange, byte[] message, int code, int length) throws IOException {
-			exchange.sendResponseHeaders(code, length);
-			OutputStream outputStream = exchange.getResponseBody();
-			outputStream.write(message);
-			outputStream.close();
+		public int getContentLength() {
+			return contentLength;
 		}
+
+		public String getContent() {
+			return content;
+		}
+
+		public Method getMethod() {
+			return method;
+		}
+	}
+}
+
+enum Method {
+	POST, GET, PUT, DELETE;
+}
+
+enum ContentHeader {
+	CONTENTTYPE("Content-Type"),
+	CONTENTLENGTH("Content-Length");
+
+	private final String header;
+
+	ContentHeader(String header) {
+		this.header = header;
+	}
+
+	public String getHeader() {
+		return this.header;
+	}
+
+	public static ContentHeader fromString(String text) {
+		for (ContentHeader header: ContentHeader.values()) {
+			if(header.getHeader().equals(text)) {
+				return header;
+			}
+		}
+		return null;
+	}
+}
+
+enum MIMETypes {
+	TEXTPLAIN("text/plain"),
+	IMAGEPNG("text/html"),
+	;
+
+	private final String value;
+
+	MIMETypes(String value) {
+		this.value = value;
+	}
+
+	public String getValue() {
+		return value;
+	}
+
+	public static MIMETypes fromString(String text) {
+		for (MIMETypes type: MIMETypes.values()) {
+			if(type.getValue().equals(text)) {
+				return type;
+			}
+		}
+		return null;
 	}
 }
