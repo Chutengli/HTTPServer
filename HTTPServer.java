@@ -263,7 +263,7 @@ enum ContentHeader {
 
 enum MIMETypes {
 	TEXTPLAIN("text/plain"),
-	IMAGEPNG("text/html"),
+	TEXTHTML("text/html"),
 	;
 
 	private final String value;
